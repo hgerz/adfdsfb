@@ -1,0 +1,857 @@
+%%[ /* TEST */
+
+SET @triggerEscapeValue = "n/a"
+
+SET @guestsDE = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','guestsDE')
+SET @permissionsDE = Lookup(@cxConfigDE,"parameterValue","parameterContext",@parentBU,"parameterName","permissionsDE")
+SET @subscriptionArchiveDE = Lookup(@cxConfigDE,"parameterValue","parameterContext",@parentBU,"parameterName","subscriptionArchiveDE")
+SET @relaxedBlocklist = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','relaxedBlockListName')
+
+/* start affinities 1/2 */ 
+SET @guestAffinitiesDE = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','guestAffinitiesDEBaseName')
+SET @affinitiesDE = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','affinitiesDEBaseName')
+SET @affinityArchiveDE = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','affinityArchiveDEBaseName')
+
+IF @environment == "test" THEN
+   SET @guestAffinitiesDE = concat("TEST_",@guestAffinitiesDE)
+   SET @affinitiesDE = concat("TEST_",@affinitiesDE)
+   SET @affinityArchiveDE = concat("TEST_",@affinityArchiveDE)
+ELSE 
+   SET @guestAffinitiesDE = concat("LIVE_",@guestAffinitiesDE)
+   SET @affinitiesDE = concat("LIVE_",@affinitiesDE)
+   SET @affinityArchiveDE = concat("LIVE_",@affinityArchiveDE)
+ENDIF
+/* end affinities 1/2 */
+
+SET @recordTypeId = Lookup(@cxConfigDE,"parameterValue","parameterContext",@parentBU,"parameterName","recordTypeIdForContactCreation")
+SET @defaultLastName = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','defaultLastname')
+SET @defaultSalutation = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','defaultSalutation')
+SET @defaultCurrencyIsoCode = Lookup(@cxConfigDE,'parameterValue','parameterContext',@accountId,'parameterName','defaultCurrencyIsoCode')
+
+SET @termsAndConditionsVersion = "" /* for future */
+SET @specialTermsAndConditionsVersionCategory = Lookup(@cxSwitcherDE,"textContent","businessUnit",@accountId,"context","dynamic","textClass",@sourceCategory,"textSubClass","dynamic","textId","termsAndConditionsVersionCategory")
+SET @defaultTermsAndConditionsVersionCategory = Lookup(@cxConfigDE,"parameterValue","parameterContext",@accountId,"parameterName","defaultTermsAndConditionsVersionCategory")
+
+IF not empty(@specialTermsAndConditionsVersionCategory) THEN
+  SET @termsAndConditionsVersionCategory = @specialTermsAndConditionsVersionCategory
+ELSEIF not empty(@defaultTermsAndConditionsVersionCategory) THEN
+  SET @termsAndConditionsVersionCategory = @defaultTermsAndConditionsVersionCategory
+ELSE
+  SET @termsAndConditionsVersionCategory = "explicit"
+ENDIF
+/* custom if multiCurrency */
+SET @currencyIsoCode = @defaultCurrencyIsoCode
+/*SET @defaultProspectStatus = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','defaultProspectStatus')*/
+/* end custom*/
+
+IF @codeExecutionOrigin != 'doiConfirmation' THEN
+  SET @initiatingSystem = "internal"
+  /* we need more variables if the subscribe endpoint skipped an email and directly confirmed without pushing data through as params.*/
+
+  SET @relationId = @subscriberKey
+  /* note that the subscribe endpoint at this point still uses the DOI_ ID as @subscriberkey! */
+  SET @completePermissions = Lookup(@guestsDE,"permissionType","subscriberkey",@relationId)
+  SET @permissionTypeAsRowset = BuildRowSetFromString(@completePermissions,",")
+  SET @rowCountPermissions = rowCount(@permissionTypeAsRowset)
+
+  SET @permissionsDefinitionDE = Lookup(@cxConfigDE,"parameterValue","parameterContext",@parentBU,"parameterName","permissionsDefinitionDE")
+ENDIF
+
+/* Handling of "BLOCKED" */
+/* Assumptions: There are one or more auto suppression configurations, where the user's email is listed to exclude him from all sends. */
+SET @userOnBlacklist = ""
+SET @listOfAllRelevantASCNames = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','strictBlocklistName')
+SET @blacklistsAsRowset = BuildRowSetFromString(@listOfAllRelevantASCNames)
+SET @rowCountblacklists = rowcount(@blacklistsAsRowset)
+IF @rowCountblacklists > 0 THEN
+  FOR @i = 1 TO @rowCountblacklists DO
+    SET @row = row(@blacklistsAsRowset,@i)
+    SET @blacklist = field(@row,1)
+    SET @occurrenceOnBlacklist = Lookup(@blacklist, "Email Address", "Email Address", @email) 
+    IF not empty(@occurrenceOnBlacklist) THEN
+      SET @userOnBlacklist = "true"
+    ENDIF        
+  NEXT @i
+ENDIF
+
+SET @startTechnicalProcessing = "false"   
+/* technical: guest DE, Subscription, Contact creation & ID provision in SFSC, removal from Global commercial */
+SET @startBusinessProcessing = "false"   
+/* business: resubscription, set permissions, removal from permission-related autosuppression  */
+
+IF @userOnBlacklist == "true" THEN
+    /* business case: contact is on one of the global blacklists in Parent BU */
+    SET @statusmessage = "doiAddressBlocked"  
+    SET @startTechnicalProcessing = "false" 
+    SET @startBusinessProcessing = "false"
+  /* This assumes that bounce handling happens in the All Subscribers list, and only HELD  - hard bounced - users are treated as bounces) */
+ELSEIF @subscriber_status == "held" THEN
+    /* business case: contact is registered as hardbounced / held */
+    SET @statusmessage = "doiAddressBounced"
+    SET @startTechnicalProcessing = "true" 
+    SET @startBusinessProcessing = "false"
+ELSEIF @subscriber_status == "technicalValidationError" THEN
+    /* business case: contact is invalid due to syntax / list detective check */
+    SET @statusmessage = "doiTechnicalValidationError"
+    SET @startTechnicalProcessing = "true"
+    SET @startBusinessProcessing = "false"
+ELSEIF not EMPTY(@listDetectiveError) THEN
+    SET @statusmessage = "listDetectiveError"  
+    SET @startTechnicalProcessing = "true"
+    SET @startBusinessProcessing = "false"
+ELSE /* success */
+    SET @startTechnicalProcessing = "true"
+    SET @startBusinessProcessing = "true"
+ENDIF
+
+IF @startTechnicalProcessing == "true" THEN
+  /* start processing phase */
+  IF @initiatingSystem == "internal" THEN
+    
+    /* for internal usecases, data is already in guests DE; external systems have to send it in the payload */
+    SET @firstname = Lookup(@guestsDE,"firstname","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @lastname = Lookup(@guestsDE,"lastname","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @gender = Lookup(@guestsDE,"gender","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @utmSource = Lookup(@guestsDE,"utm_source","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @utmMedium = Lookup(@guestsDE,"utm_medium","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @utmCampaign =Lookup(@guestsDE,"utm_campaign","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @utmTerm = Lookup(@guestsDE,"utm_term","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+    SET @utmContent = Lookup(@guestsDE,"utm_content","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)
+
+    /* temp subscriberkey from guests is relationId for DOI entry in subscriptionArchive */
+    SET @relationId = Lookup(@guestsDE,"subscriberKey","email",@email,'permissionType',@completePermissions,'channel',@channel,'locale',@locale)        
+
+  ELSE
+    SET @firstname = RequestParameter("firstname")
+    SET @lastname = RequestParameter("lastname")
+    SET @gender = RequestParameter("gender")
+    SET @utmSource = Requestparameter("utm_source")
+    SET @utmMedium = Requestparameter("utm_medium")
+    SET @utmCampaign = Requestparameter("utm_campaign")
+    SET @utmTerm = Requestparameter("utm_term")
+    SET @utmContent = Requestparameter("utm_content")
+
+  ENDIF
+ENDIF
+
+]%%<script type="javascript" runat="server">
+
+var environment = Variable.GetValue("@environment")
+/* start Sales Cloud processing */
+var systemUsesPersonAccounts = false;
+/* time between create and retrieve */
+var millisecondsToSleepForPersonAccount = 100; 
+
+var log = Variable.GetValue("@doiLogDE")
+Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["doiConfirmationCode - SFSCProcessing",timezoneOffset]);
+
+var email = Variable.GetValue("@email");
+var guestsDE = Variable.GetValue("@guestsDE");
+var guestAffinitiesDE = Variable.GetValue("@guestAffinitiesDE");
+var synchFieldName = ""
+//custom
+var localeFromMarketing = Variable.GetValue("@locale"); 
+var startTechnicalProcessing = Variable.GetValue("@startTechnicalProcessing");
+var environment = Variable.GetValue("environment");
+var defaultLastname = Variable.GetValue("defaultLastname");
+var updateFieldArray = [];
+var createFieldArray = [];
+
+if (startTechnicalProcessing == "true") {
+ 
+ var relationId = Variable.GetValue("@relationId");
+ var sfMainObj = "";
+ var sfSubOrdinateObj = "";
+ var emailFieldName = "";
+ var birthdateFieldName = "";
+ var RetrieveMainObjResult = "";
+ var contactObjectToUpdate = "";
+ var contactIdFieldName = "";
+ var variableGeneratedFromCreate = "";
+
+ if (systemUsesPersonAccounts == true) {
+  sfMainObj = "Account";
+  sfSubOrdinateObj = "Contact";
+  contactObjectToUpdate = sfSubOrdinateObj;
+  var variableGeneratedFromRetrieveSubObj = "contactId";
+  var recordTypeId = Variable.GetValue("@recordTypeId");
+  
+  synchFieldName = "SynchToSFMC__pc" // custom 
+  contactIdFieldName = "PersonContactId";
+  emailFieldName = "PersonEmail";
+  birthdateFieldName = "PersonBirthdate";
+  variableGeneratedFromCreate = "sfAccountId"
+  RetrieveMainObjResult = "sfAccountId"; 
+  
+  // recordType is necessary for creation of a personAccount
+  createFieldArray.push('recordTypeId');
+  createFieldArray.push(recordTypeId);
+
+ } else { 
+
+  sfMainObj = "Contact";
+  contactObjectToUpdate = sfMainObj;
+
+  synchFieldName = "SynchToSFMC__c" // custom 
+  contactIdFieldName = "Id";
+  emailFieldName = "email";
+  birthdateFieldName = "Birthdate";
+  RetrieveMainObjResult = "existingContactId";
+  variableGeneratedFromCreate = "contactId";
+  // custom
+  localeFromMarketingFieldName = "LocaleFromMarketing__c";
+ }
+
+  // email is always created.
+  createFieldArray.push(emailFieldName);
+  createFieldArray.push(email);
+
+  // email is never updated.
+
+  // synchToSFMC is always set to true upon create
+  createFieldArray.push(synchFieldName);
+  createFieldArray.push(true);  
+  
+  // synchToSFMC is always set to true upon update
+  updateFieldArray.push(synchFieldName);
+  updateFieldArray.push(true);
+
+  // localeFromMarketing -> custom
+  updateFieldArray.push(localeFromMarketingFieldName);
+  updateFieldArray.push(localeFromMarketing); 
+
+  // retrieves from guest DE
+  var firstnameForSFSC = Platform.Function.Lookup(guestsDE,"firstname",["subscriberKey"],[relationId])
+  if (firstnameForSFSC) {
+    // firstname will be created if not empty
+    createFieldArray.push('Firstname');
+    createFieldArray.push(firstnameForSFSC);
+
+    // will be updated if not empty
+    // updateFieldArray.push('Firstname');
+    // updateFieldArray.push(firstnameForSFSC);
+  }
+
+  var lastnameForSFSC = Platform.Function.Lookup(guestsDE,"lastname",["subscriberKey"],[relationId])
+  if (!lastnameForSFSC) {
+    // has to be created with defaultLastname always
+    lastnameForSFSC = defaultLastname
+  }
+  createFieldArray.push('Lastname');
+  createFieldArray.push(lastnameForSFSC);
+  
+  if (lastnameForSFSC 
+    && lastnameForSFSC != defaultLastname) {
+    // will be updated if not empty, but do not update with defaultLastname
+    // updateFieldArray.push('Lastname');
+    // updateFieldArray.push(lastnameForSFSC);
+  }
+
+  var genderForSFSC = Platform.Function.Lookup(guestsDE,"gender",["subscriberKey"],[relationId])
+
+  if (genderForSFSC) {
+    // manipulation from subscribeViaAPI standard (male / female / other) to Mr. Mrs. 
+    if(genderForSFSC == "male" ) {
+      genderForSFSC = "Mr."
+    } else if (genderForSFSC == "female") {
+      genderForSFSC = "Mrs."
+    }
+
+    // will be created if not empty
+    createFieldArray.push('Salutation');
+    createFieldArray.push(genderForSFSC);
+
+    // will be updated if not empty
+   // updateFieldArray.push('Salutation');
+   // updateFieldArray.push(genderForSFSC);
+  }
+
+  var birthdateForSFSC = Platform.Function.Lookup(guestAffinitiesDE,"affinityValue",["subscriberKey","affinityKey"],[relationId,"birthdate__sfmc"])
+
+  if(birthdateForSFSC) {
+
+    //convert to date 
+    birthdateForSFSC = new Date(birthdateForSFSC); 
+    var year = birthdateForSFSC.getFullYear();
+    var month = (birthdateForSFSC.getMonth()+1);
+    var day = birthdateForSFSC.getDate();
+    if(month<10) month = '0'+month;
+    if(day<10) day = '0'+day;
+    var h = birthdateForSFSC.getHours();
+    var m = birthdateForSFSC.getMinutes();
+    var s = birthdateForSFSC.getSeconds();
+    var ms = birthdateForSFSC.getMilliseconds();
+    if(h<10) h = '0'+h;
+    if(m<10) m = '0'+m;
+    if(s<10) s = '0'+s;
+    //var sfmcOffsetFromUTC = "-06:00" 
+    //var formattedTimestamp = year + "-" + month + '-' + day + 'T' + h + ':' + m + ":" + s + sfmcOffsetFromUTC; 
+    var formattedDate = year + "-" + month + '-' + day;
+   
+    // birthdate will be created if not empty
+    createFieldArray.push(birthdateFieldName);
+    createFieldArray.push(formattedDate);
+
+    // birthdate will be updated if not empty
+    // updateFieldArray.push(birthdateFieldName);
+    // updateFieldArray.push(formattedDate);
+  }
+  var arrayOfContacts = [];
+  var getExistingIds = "";
+  getExistingIds += "\%\%[";
+  getExistingIds += " set @retrieveResults = RetrieveSalesforceObjects('" + sfMainObj + "',"
+  getExistingIds += "'" + "Id,CreatedDate,Inactive__c,Last_Communication_Date__c,Firstname,Lastname,EncryptedSFContactId__c" + "','" + emailFieldName + "', '=','" + email + "'" + "','" + Inactive__c + "', '!=','" + "true" + "'"
+  getExistingIds += " )"
+  getExistingIds += " SET @rowcount = rowcount(@retrieveResults)"
+  getExistingIds += " IF @rowcount >= 1 THEN"
+  getExistingIds += "   FOR @i = 1 to @rowcount DO"
+  getExistingIds += "     SET @row = Field(@retrieveResults,@i)"
+  getExistingIds += "     SET @id = Field(@row,"Id")"
+  getExistingIds += "     SET @createdDate = Field(@row,"CreatedDate")"
+  getExistingIds += "     IF EMPTY(Field(@row, 'Last_Communication_Date__c')) THEN"
+  getExistingIds += "       SET @lastCommunicationDate = formattedDate(Now(), 'iso')"
+  getExistingIds += "     ELSE"
+  getExistingIds += "       SET @lastCommunicationDate = Field(@row,"Last_Communication_Date__c")"
+  getExistingIds += "     ENDIF"
+  getExistingIds += "     SET @existingFirstname = Field(@row,"Firstname")"
+  getExistingIds += "     SET @existingLastname = Field(@row,"Lastname")"
+  /* custom: add EncryptedSFContactId__c */
+  getExistingIds += "     SET @externalKey = Field(@row,"EncryptedSFContactId__c")"
+  getExistingIds += "     SET @RetrieveMainObjResult = Field(@row,'" + "Id" +  "')"
+  getExistingIds += "     OUTPUT(concat(@id, ',', @createdDate ',', @lastCommunicationDate ',', @existingFirstname ',', @existingLastname ',', @externalKey))"
+  getExistingIds += "   SET next @i"
+  getExistingIds += " ENDIF"
+  getExistingIds += " ]\%\%";
+
+  var retrivedFields = Variable.GetValue(getExistingIds);
+
+  if (retrivedFields != null && retrivedFields != "") {
+    var records = retrivedFields.split(";");
+    for (var i = 0; i < records.length; i++) {
+      var fields = records[i].split(",");
+      var id = fields[0];
+      var createdDate = fields[1];
+      var lastcommunicationDate = fields[2];
+      var existingFirstname = Fields[3];
+      var existingLastname = Fields[4];
+      var externalKey = Fields[5];
+      var RetrieveMainObjResult = Fields[6];
+      // add to an object
+      var retrievedRecords = {
+        id: id;
+        createdDate: createdDate;
+        lastcommunicationDate: lastcommunicationDate;
+        existingFirstname: existingFirstname;
+        existingLastname: existingLastname;
+        externalKey: externalKey;
+        RetrieveMainObjResult: RetrieveMainObjResult;
+      };
+      arrayOfContacts.push(retrievedRecords);
+    }
+  }
+  var retrievedSubscriberKey = "";
+
+  Write("unsorted" + Stringify(arrayOfContacts));
+
+    var contacts = arrayOfContacts;
+    Write("contact" + contacts);
+
+    //if(len(contacts > 1) ) {
+    // sort desc by lastCommunicationDate
+    var contactsSortedByCommDate = arrayOfContacts.sort(function(x, y) {
+      if (x.lastCommunicationDate < y.lastCommunicationDate) {
+        return 1; /* now sorting: DESC; switch 1 / -1 around to get ASC */
+      }
+      if (x.lastCommunicationDate > y.lastCommunicationDate) {
+        return -1; /* now sorting: DESC; switch 1 / -1 around to get ASC */
+      }
+      return 0;
+    });
+    var rows = Platform.Function.InsertData("liveDOILog",["errormsg","timezoneOffset"],["test","3"]);
+
+    if(contactsSortedByCommDate[0].lastCommunicationDate == contactsSortedByCommDate[1].lastCommunicationDate) {
+    // more than one result
+     var contactsSortedByCommDateAndCreatedDate = contactsSortedByCommDate.sort(function(x, y) {
+       if (x.createdDate < y.createdDate) {
+         return 1; /* now sorting: DESC; switch 1 / -1 around to get ASC */
+       }
+       if (x.createdDate > y.createdDate) {
+         return -1; /* now sorting: DESC; switch 1 / -1 around to get ASC */
+       }
+       return 0;
+     });
+     retrievedSubscriberKey = contactsSortedByCommDateAndCreatedDate[0].contactId;
+     //var rows = Platform.Function.InsertData("liveDOILog",["errormsg","timezoneOffset"],["test"+ retrievedSubscriberKey,"4"]);
+
+    } else {
+     retrievedSubscriberKey = contactsSortedByCommDate[0].contactId
+     //var rows = Platform.Function.InsertData("liveDOILog",["errormsg","timezoneOffset"],["test"+ retrievedSubscriberKey,"5"]);
+    }
+
+    Variable.SetValue("@existingContactId", retrievedSubscriberKey);
+    //var rows = Platform.Function.InsertData("liveDOILog",["errormsg","timezoneOffset"],["test"+ retrievedSubscriberKey,"6"]);
+
+  //  } else {
+  //    //one existing found
+  //
+  //  }
+    /* end duplicateCheck */
+
+  var retrievedId = retrievedSubscriberKey;
+  Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["1111" + " " + getExistingIds,timezoneOffset]);
+
+  try {
+
+    if (environment != "test") {
+      //var retrievedId = Platform.Function.TreatAsContent(getExistingIds);
+
+      Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["2222" + " " + retrievedId,timezoneOffset]);
+
+      var updateSFObject = "";
+      if (retrievedId) {
+
+       Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["3333" + "update",timezoneOffset]);
+
+       updateSFObject += "\%\%[";
+       updateSFObject += "    SET @SFUpdateResults = UpdateSingleSalesforceObject('" + sfMainObj
+       // personContactId or ContactId
+       updateSFObject += "','" + Variable.GetValue('@RetrieveMainObjResult') + "'"
+       updateSFObject += ",'" + updateFieldArray.join("','") + "'"
+       updateSFObject += " ) "
+       updateSFObject += " OUTPUT(concat(@SFUpdateResults))"
+       updateSFObject += " ]\%\%";
+       updateResult = Platform.Function.TreatAsContent(updateSFObject);
+       Platform.Function.InsertData(log,["errormsg","timezoneOffset"],[relationId + " " + birthdateForSFSC + updateSFObject + Variable.GetValue("@SFUpdateResults"),timezoneOffset]);
+
+      } else {
+        Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["4444" + "create",timezoneOffset]);
+        var createSFObject = "";
+        var numberOfFields = createFieldArray.length/2
+        createSFObject += "\%\%[";
+        // @sfAccountId or @contactId
+        createSFObject += " SET @" + variableGeneratedFromCreate + " = CreateSalesforceObject('" + sfMainObj
+        createSFObject += "'," + numberOfFields 
+        createSFObject += ",'" + createFieldArray.join("','") + "'"
+        createSFObject += " )"
+        createSFObject += " OUTPUT(concat(@sfAccountId))"
+        createSFObject += " ]\%\%";
+
+        retrievedId = Platform.Function.TreatAsContent(createSFObject);
+
+      } /* end update / create */
+
+      if (systemUsesPersonAccounts == true) {
+        var getCreatedAccount = "";
+        // wait for x milliseconds and retrieve the created account to get personContactId
+        var start = new Date().getTime();
+        for (var i=0; i < 1e7; i++) {
+          if ((new Date().getTime() - start) > millisecondsToSleepForPersonAccount) {
+            break;
+          }
+        }
+
+       var getPersonContactId = "";
+       getPersonContactId += "\%\%["
+       getPersonContactId += " set @retrieveResults = RetrieveSalesforceObjects('" + "Account" + "',"
+       getPersonContactId += " 'Id,PersonContactId', 'Id','=','" + retrievedId + "'"
+       getPersonContactId += " )"
+       getPersonContactId += " SET @rowcount = rowcount(@retrieveResults)"
+       getPersonContactId += " IF @rowcount > 0 THEN"
+       getPersonContactId += "    SET @row = ROW(@retrieveResults,1)"
+       getPersonContactId += "    SET @contactId = FIELD(@row, 'PersonContactId' )"
+       getPersonContactId += "   OUTPUT(concat(@contactId))"
+       getPersonContactId += " ENDIF"
+       getPersonContactId += " ]\%\%";
+       Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["5555" + "retrievePCID" + getPersonContactId,timezoneOffset]);
+
+       var createdContactId = Platform.Function.TreatAsContent(getPersonContactId)
+
+       Variable.SetValue("@contactId",Variable.GetValue("@contactId"))
+       
+      } else {
+       // begin untested 
+       Variable.SetValue("@contactId",createResult)
+       Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["createResult" + createResult,timezoneOffset]);
+    // end untested 
+      } /* end PCID retrieve */     
+    } /* end test */  
+  } catch (err) {
+
+    var stringifiedErr = Stringify(err)
+    Platform.Function.InsertData(log,["errormsg","timezoneOffset"],["Critical - " + stringifiedErr + " " + updateSFObject,timezoneOffset]);
+  }
+}
+
+// store the data that we don't want to update as affinityValues, DEs depending on TEST / LIVE
+var updateDataAffSource = Variable.GetValue("@source");
+var updateDataSubmissionSetKey = Platform.Function.GUID();
+var updateDataAffState = "active";
+var affinitiesDE = Variable.GetValue("@affinitiesDE");
+var affinityArchiveDE = Variable.GetValue("@affinityArchiveDE");
+
+var updateDataArray = [];
+
+var updatedFirstname = Variable.GetValue("@firstname")
+var updatedLastname = Variable.GetValue("@lastname")
+var updatedGender = Variable.GetValue("@gender")
+
+if(updatedFirstname) {
+  updateDataArray.push({"key": "firstname__sfmc","value": updatedFirstname})
+}
+if(updatedLastname) {
+  updateDataArray.push({"key": "lastname__sfmc","value": updatedLastname})    
+}
+if(updatedGender) {
+  updateDataArray.push({"key": "gender__sfmc","value": updatedGender})
+}
+
+var numberOfFields = updateDataArray.length;
+
+for (var i = 0; i < numberOfFields; i++) {              
+  var oneField = Stringify(updateDataArray[i]);
+  var strField = Platform.Function.ParseJSON(oneField);
+  var oneKey = strField.key;
+  var oneValue = strField.value;
+  Platform.Function.UpsertData(affinitiesDE,["subscriberKey","affinityKey","affinitySource"],[Variable.GetValue("@contactId"),oneKey,updateDataAffSource],["submissionSetKey","affinityState","affinityValue","lastChangeDateServertime"],[updateDataSubmissionSetKey,updateDataAffState,oneValue,Platform.Function.Now()]);
+  Platform.Function.UpsertData(affinityArchiveDE,["subscriberKey","affinityKey","affinitySource","submissionSetKey"],[Variable.GetValue("@contactId"),oneKey,updateDataAffSource,updateDataSubmissionSetKey],["affinityState","affinityValue","changeDateServertime"],[updateDataAffState,oneValue,Platform.Function.Now()]);
+}
+
+//combine the updates from here  with the formDataJson from interface to inject both to inboundQueue
+var inboundQueueJSONArray = Variable.GetValue("@formdataJSON")
+
+if(inboundQueueJSONArray) {
+  inboundQueueJSONArray = Platform.Function.ParseJSON(inboundQueueJSONArray);
+} else {
+  inboundQueueJSONArray = [];
+}
+if(updatedFirstname) {
+  inboundQueueJSONArray.push({"affinityKey": "firstname__sfmc","state":"active","affinityValue": updatedFirstname})
+}
+if(updatedLastname) {
+  inboundQueueJSONArray.push({"affinityKey": "lastname__sfmc","state":"active","affinityValue": updatedLastname})
+}
+if(updatedGender) {
+  inboundQueueJSONArray.push({"affinityKey": "gender__sfmc","state":"active","affinityValue": updatedGender})
+}
+
+Variable.SetValue("@inboundQueueJSON",Stringify(inboundQueueJSONArray));
+
+</script>%%[/* debug 
+
+IF @environment != "test" THEN
+  SET @contactId = "testcx"
+ELSE 
+ SET @contactId = "testCX_TEST"
+ENDIF  
+/* end debug */
+
+/* end Sales Cloud processing */
+
+/* set the variable that potential welcome triggers understand */
+
+SET @subscriberKey = @contactId
+
+IF @startBusinessProcessing == "true" THEN
+
+  /* additionalProcessing lookup in cxSwitcher */
+  InsertData(@doiLogDE,"errormsg",concat("doiConfirmationCode - additionalProcessingLookup start"))
+   /* exact source defines additional processing */
+    SET @process = "welcomeProcessing"
+    SET @marker = "doiConfirmationCode - debugMarker: "
+
+  /* additionalProcessing lookup basics */
+    IF empty(@permissionTypeForAssetLookup) THEN
+      SET @permissionTypeForAssetLookup = @permissionType
+      IF @rowCountPermissions > 1 THEN
+        SET @permissionTypeForAssetLookup = "multiPermission"
+      ENDIF
+    ENDIF
+
+    SET @exactMatchOnSource = Lookup(@cxSwitcherDE
+        ,"textContent"
+        ,"businessUnit",@accountId
+        ,"context","dynamic"
+
+        ,"textClass","dynamic"
+        ,"textSubClass",@source
+
+        ,"textId",@process
+      )
+
+    IF empty(@exactMatchOnSource) THEN
+      /* fallback: decisionHierarchy */ 
+      SET @marker = concat(@marker,"no exact match; ")
+      SET @additTextClass = @permissionTypeForAssetLookup
+      SET @additContext = @sourceCategory 
+  
+      SET @existingEntryForSubClass = Lookup(@cxSwitcherDE
+        ,"textSubClass"
+        ,"businessUnit",@accountId
+        ,"textClass",@additTextClass
+        ,"context",@sourceCategory
+        ,"textId",@process
+      )
+
+      SET @marker = concat(@marker," tried to find existing entry with matching sourceCategory  ", @sourceCategory,";")
+      SET @additTextSubClass = "dynamic" 
+
+      SET @marker = concat(@marker, "attempting matches; ")
+      SET @potentialMatchesWithIgnoredSubClass = LookupRows(@cxSwitcherDE
+      ,"businessUnit",@accountId
+      ,"textClass",@additTextClass
+      ,"textSubClass",@additTextSubClass
+      ,"textId",@process
+      )
+  
+      SET @rowCount = rowcount(@potentialMatchesWithIgnoredSubClass)
+      
+      SET @marker = concat(@marker, "matches:",@rowCount,"; ")
+
+      SET @contextMatchFound = "false"
+      IF @rowCount > 0 THEN
+        FOR @i = 1 to @rowCount DO
+          SET @row = row(@potentialMatchesWithIgnoredSubClass,@i)
+          SET @currentContext = field(@row,"context")
+          IF @currentContext == @additContext THEN
+            /*SET @additContextForLookup = @sourceCategory*/
+            SET @contextMatchFound = "true"  
+          ENDIF      
+        NEXT @i
+      ENDIF
+  
+      SET @marker = concat(@marker, "sourceCategory-context match Found:",@contextMatchFound,"; ")
+      
+      IF @contextMatchFound == "true" 
+      THEN
+        /* keep context / sourceCategory */
+        SET @additContextForLookup = @additContext
+      ELSE
+        /* ignore  context / sourceCategory, try with dynamic */
+        SET @additContextForLookup = "dynamic"  
+      ENDIF
+      SET @marker = concat(@marker, "resolving to: ",@additContextForLookup," + ",@additTextClass, " + ", @additTextSubClass," + ",@process)
+    ELSE
+      SET @marker = concat(@marker," successfully resolved by exact match on source, ignoring permissionType and sourceCategory")
+    ENDIF
+    InsertData(@doiLogDE,"errormsg",@marker,"timezoneOffset",@timezoneOffset,"subscriberKey",@contactId,"permissionType",@completePermissions)
+    /* end decisionHierarchy */
+    /* end additionalProcessing lookup */
+
+  IF empty(@exactMatchOnSource) THEN
+    SET @additionalProcessingBlock = Lookup(@cxSwitcherDE
+     ,"textContent"
+     ,"businessUnit",@accountId
+     ,"context",@additContextForLookup
+     ,"textClass",@additTextClass
+
+
+     ,"textSubClass",@additTextSubClass
+
+     ,"textId",@process
+    )
+  ELSE 
+    SET @additionalProcessingBlock = @exactMatchOnSource
+  ENDIF
+  
+  IF not empty(@additionalProcessingBlock) 
+  and @additionalProcessingBlock != @triggerEscapeValue
+  THEN
+
+    InsertData(@doiLogDE,"errormsg",concat("doiConfirmationCode - calling block: ",@additionalProcessingBlock))
+
+    IF @environment != "test" THEN
+      IF @skipAdditionalProcessing != "true" THEN 
+       ]%%%%=ContentBlockByKey(@additionalProcessingBlock)=%%%%[ 
+      ENDIF
+    ENDIF
+    /* useful things in your block: 
+        
+      SET @skipAllSubsProcessing = "true" to not (or differently) interact with All Subscribers (setting to active)
+      SET @skipGuestProcessing = "true" to not (or differently) interact with guests and affinities
+      SET @skipStandardDataExtensionProcessing = "true" to not (or differently) interact with permissions, subscriptionArchive.
+      SET @skipRelaxedBlocklistProcessing = "true" to not (or differently) interact with relaxedBlocklist
+      SET @statusMessage = "additionalProcessingError" if you want to show an error
+      SET @additionalStatus = "success" to let the system know an email was sent.              
+      plus: SET @statusdetailsPart2 = what you want to see in response 
+    */
+  ELSE 
+    /* lookup and execute default trigger */
+    SET @defaultDoiAddtProcessingBlock = Lookup(@cxConfigDE,'parameterValue','parameterContext',@parentBU,'parameterName','defaultDoiAddtProcessingBlock') 
+
+    InsertData(@doiLogDE,"errormsg",concat("doiConfirmationCode - calling block defaultDoiAddtProcessingBlock: ",@defaultDoiAddtProcessingBlock))
+
+    IF not empty(@defaultDoiAddtProcessingBlock) THEN 
+      ]%%%%=ContentBlockByKey(@defaultDoiAddtProcessingBlock)=%%%%[ 
+    ENDIF
+  ENDIF
+ENDIF 
+
+IF @startBusinessProcessing == "true" THEN
+  /* start Marketing Cloud processing */
+  IF @skipAllSubsProcessing != "true" THEN
+    IF @environment != "test" THEN
+      /* resubscribe */
+      SET @status = "Active" /* valid options: "Unsubscribed" & "Active" */
+      
+      /* Update the All Subscribers list */ 
+      SET @ll_sub = CreateObject("Subscriber")
+      SetObjectProperty(@ll_sub,"SubscriberKey", @contactId)
+       
+      SET @client = CreateObject("ClientID")
+      SetObjectProperty(@client, "ID", @accountId)
+      SetObjectProperty(@client, "IDSpecified", "true")
+      SetObjectProperty(@ll_sub, "Client", @client)
+       
+      /* MID ? */
+
+      SetObjectProperty(@ll_sub,"Status", @status)
+      SET @options = CreateObject("UpdateOptions")
+      SET @save = CreateObject("SaveOption")
+      SetObjectProperty(@save,"SaveAction","UpdateAdd")
+      SetObjectProperty(@save,"PropertyName","Status")
+      AddObjectArrayItem(@options,"SaveOptions", @save)
+             
+      SET @update_sub = InvokeUpdate(@ll_sub, @update_sub_status, @update_sub_errorcode, @options)
+    ENDIF /* test wrapper */
+  ENDIF /* end skipAllSubsProcessing */
+ENDIF /* decision wrapper */ 
+
+IF @startTechnicalProcessing == "true" THEN
+  IF @skipGuestProcessing != "true" THEN  
+    IF @environment != "test" THEN
+      UpsertData(@guestsDE,4   
+        ,'email',@email  
+        ,'permissionType',@completePermissions 
+        ,'channel',@channel
+        ,'locale',@locale   
+        ,'accountId',@accountId  
+        ,'sourceCategory',@sourceCategory 
+        ,'source',@source  
+        ,'confirmDate',Now() 
+        ,'timezoneOffsetConfirmDate',@timezoneOffset 
+        ,'firstname',@firstname  
+        ,'lastname',@lastname  
+        ,'gender',@gender  
+        ,'externalKey',@externalKey  
+        ,'sfId',@contactId 
+        ,'utm_source',@utmSource 
+        ,'utm_medium',@utmMedium 
+        ,'utm_campaign',@utmCampaign 
+        ,'utm_term',@utmTerm 
+        ,'utm_content',@utmContent)
+        /* affinities start */
+
+      /* get all info from the guestAffinities DE */
+
+      SET @guestAffinityRecords = LookupRows(@guestAffinitiesDE,"subscriberKey",@relationId)  
+      SET @rowCountAffinities = rowCount(@guestAffinityRecords)
+      InsertData(@doiLogDE,"errormsg",concat("doiConfirmationCode - affinities","pre",@guestAffinitiesDE,@contactId,@rowCountAffinities,@relationId),"timezoneOffset",@timezoneOffset,"subscriberKey",@contactId,"permissionType",@completePermissions)
+
+      IF @rowCountAffinities > 0 THEN
+        FOR @i = 1 to @rowCountAffinities DO
+          SET @row = row(@guestAffinityRecords, @i) /* get row based on counter */
+          SET @affinityKey = field(@row,"affinityKey") 
+          SET @affinitySource = @source
+          SET @submissionSetKey = field(@row,"submissionSetKey")          
+          SET @affinityState = field(@row,"affinityState")
+          SET @affinityValue = field(@row,"affinityValue")
+
+          /* upsert into affinities DE */       
+          UpsertData(@affinitiesDE,3
+            ,"subscriberKey",@contactId
+            ,"affinityKey",@affinityKey
+            ,"affinitySource",@affinitySource
+            ,"submissionSetKey",@submissionSetKey
+            ,"affinityState",@affinityState
+            ,"affinityValue",@affinityValue
+          )
+
+          /* upsert into affinityArchive DE incl submissionSetKey as PK */
+          UpsertData(@affinityArchiveDE,4
+            ,"subscriberKey",@contactId
+            ,"affinityKey",@affinityKey
+            ,"affinitySource",@affinitySource
+            ,"submissionSetKey",@submissionSetKey
+            ,"affinityState",@affinityState
+            ,"affinityValue",@affinityValue
+            ,"sourceCategory",@sourceCategory
+            ,"source",@source         
+          )
+        NEXT @i 
+      ENDIF       
+      /* affinities end */
+    ENDIF /* test wrapper */
+  ENDIF /* end skipGuestProcessing */
+ENDIF /* decision wrapper */ 
+
+IF @startTechnicalProcessing == "true" THEN
+  IF @skipStandardDataExtensionProcessing != "true" THEN
+    FOR @i = 1 to @rowCountPermissions DO
+      SET @row = row(@permissionTypeAsRowset, @i) /* get row based on counter */
+      SET @permissionType = field(@row,1)
+
+      IF @environment != "test" THEN    
+        SET @archiveRowkey = GUID()
+        InsertData(@subscriptionArchiveDE
+          ,"rowkey",@archiveRowkey
+          ,"subscriberKey",@contactId
+          ,"sourceCategory",@sourceCategory
+          ,"source",@source
+          ,"permissionType",@permissionType
+          ,"channel",@channel
+          ,"confirmIP",@ip
+          ,"confirmDate",NOW()
+          ,"timezoneOffsetConfirmDate",@timezoneOffset
+          ,"lastChangeDateServertime",NOW()
+          ,"accountId",@accountId
+          ,"locale",@locale
+          ,"relationId",@relationId
+          ,'utm_source',@utmSource
+          ,'utm_medium',@utmMedium
+          ,'utm_campaign',@utmCampaign
+          ,'utm_term',@utmTerm
+          ,'utm_content',@utmContent
+          ,"termsAndConditionsVersion",@termsAndConditionsVersion
+          ,"termsAndConditionsVersionCategory",@termsAndConditionsVersionCategory
+        )
+
+      ENDIF /* test wrapper */
+
+      SET @utcDate = DateAdd(NOW(), 6, "h")
+      /* for print ok for email not */
+      IF @environment != "test" THEN    
+        Upsertdata(@permissionsDE,3
+          ,"subscriberkey",@contactId
+          ,"permissionType",@permissionType
+          ,"channel",@channel
+          ,"state","active"
+          ,"grantedLastTimestampUTC",@utcDate
+          ,"grantedLastSourceCategory",@sourceCategory
+          ,"grantedLastSource",@source
+          ,"termsAndConditionsVersion",@termsAndConditionsVersion
+          ,"termsAndConditionsVersionCategory",@termsAndConditionsVersionCategory
+        )
+
+        SET @ASCtoRemoveFrom = Lookup(@permissionsDefinitionDE,'locationForSuppressions','accountId',@accountId,'channel','email','permissionType',@permissionType)
+        IF not empty(@ASCtoRemoveFrom) THEN  
+          IF @environment != "test" THEN
+            IF @completePermissions != "transactional" THEN 
+              SET @delete = DeleteData(@ASCtoRemoveFrom,'Email Address',@email) 
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDIF /* test wrapper */
+    NEXT @i
+  ENDIF /* end skipStandardDataExtensionProcessing */
+ENDIF
+IF @startTechnicalProcessing == "true" THEN
+  IF @skipRelaxedBlocklistProcessing != "true" THEN
+    IF @environment != "test" THEN
+      IF @completePermissions != "transactional" THEN
+        SET @delete = DeleteData(@relaxedBlocklist,'Email Address',@email) 
+      ENDIF
+    ENDIF
+  ENDIF /* end skipRelaxedBlocklistProcessing */
+ENDIF
+
+]%%
